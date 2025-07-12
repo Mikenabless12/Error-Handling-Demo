@@ -8,16 +8,20 @@
 (define-constant ERR-INVALID-PASSWORD (err u107))
 (define-constant ERR-ACCOUNT-LOCKED (err u108))
 (define-constant ERR-WITHDRAWAL-LIMIT-EXCEEDED (err u109))
+(define-constant ERR-INVALID-PAGE (err u110))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-supply uint u1000000)
 (define-data-var daily-withdrawal-limit uint u10000)
+(define-data-var transaction-counter uint u0)
 
 (define-map user-balances principal uint)
 (define-map user-passwords principal (string-ascii 64))
 (define-map user-locked principal bool)
 (define-map daily-withdrawals principal uint)
 (define-map withdrawal-timestamps principal uint)
+(define-map transaction-history uint {user: principal, tx-type: (string-ascii 16), amount: uint, counterparty: (optional principal), block-height: uint})
+(define-map user-transaction-count principal uint)
 
 (define-public (create-account (password (string-ascii 64)))
   (let ((caller tx-sender))
@@ -28,6 +32,7 @@
         (map-set user-passwords caller password)
         (map-set user-locked caller false)
         (map-set daily-withdrawals caller u0)
+        (map-set user-transaction-count caller u0)
         (ok true)))))
 
 (define-public (deposit (amount uint))
@@ -39,6 +44,7 @@
         ERR-INVALID-AMOUNT
         (begin
           (map-set user-balances caller (+ current-balance amount))
+          (unwrap-panic (log-transaction caller "deposit" amount none))
           (ok current-balance))))))
 
 (define-public (withdraw (amount uint) (password (string-ascii 64)))
@@ -68,6 +74,7 @@
                       (map-set daily-withdrawals caller amount)
                       (map-set daily-withdrawals caller (+ daily-withdrawn amount)))
                     (map-set withdrawal-timestamps caller stacks-block-height)
+                    (unwrap-panic (log-transaction caller "withdraw" amount none))
                     (ok (- current-balance amount))))))))))))
 
 (define-public (transfer (recipient principal) (amount uint) (password (string-ascii 64)))
@@ -95,6 +102,8 @@
                     (begin
                       (map-set user-balances caller (- sender-balance amount))
                       (map-set user-balances recipient (+ recipient-balance amount))
+                      (unwrap-panic (log-transaction caller "transfer-out" amount (some recipient)))
+                      (unwrap-panic (log-transaction recipient "transfer-in" amount (some caller)))
                       (ok true))))))))))))
 
 (define-public (lock-account (user principal))
@@ -199,3 +208,83 @@
     (if is-locked
       ERR-ACCOUNT-LOCKED
       (ok true))))
+
+(define-private (log-transaction (user principal) (tx-type (string-ascii 16)) (amount uint) (counterparty (optional principal)))
+  (let ((current-counter (var-get transaction-counter))
+        (user-tx-count (default-to u0 (map-get? user-transaction-count user))))
+    (begin
+      (map-set transaction-history current-counter {
+        user: user,
+        tx-type: tx-type,
+        amount: amount,
+        counterparty: counterparty,
+        block-height: stacks-block-height
+      })
+      (map-set user-transaction-count user (+ user-tx-count u1))
+      (var-set transaction-counter (+ current-counter u1))
+      (ok current-counter))))
+
+(define-read-only (get-transaction (tx-id uint))
+  (match (map-get? transaction-history tx-id)
+    transaction (ok transaction)
+    (err u404)))
+
+(define-read-only (get-user-transactions (user principal) (page uint) (per-page uint))
+  (if (or (is-eq page u0) (is-eq per-page u0) (> per-page u50))
+    ERR-INVALID-PAGE
+    (let ((user-tx-count (default-to u0 (map-get? user-transaction-count user)))
+          (start-index (* (- page u1) per-page))
+          (max-results (if (> per-page u10) u10 per-page)))
+      (if (>= start-index user-tx-count)
+        (ok (list))
+        (ok (get results (get-user-transactions-range user start-index max-results)))))))
+
+(define-read-only (get-user-transaction-count (user principal))
+  (ok (default-to u0 (map-get? user-transaction-count user))))
+
+(define-read-only (get-recent-transactions (limit uint))
+  (if (or (is-eq limit u0) (> limit u20))
+    (ok (list))
+    (let ((current-counter (var-get transaction-counter))
+          (start-id (if (>= current-counter limit) (- current-counter limit) u0)))
+      (ok (get results (get-transactions-range start-id limit))))))
+
+(define-private (get-user-transactions-range (user principal) (start uint) (count uint))
+  (let ((current-counter (var-get transaction-counter)))
+    (fold check-and-add-user-transaction 
+          (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+          {user: user, start: start, count: count, found: u0, results: (list), current-id: u0})))
+
+(define-private (get-transactions-range (start-id uint) (count uint))
+  (let ((current-counter (var-get transaction-counter)))
+    (fold check-and-add-transaction
+          (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19)
+          {start: start-id, count: count, found: u0, results: (list), current-id: start-id})))
+
+(define-private (check-and-add-user-transaction (index uint) (state {user: principal, start: uint, count: uint, found: uint, results: (list 10 {user: principal, tx-type: (string-ascii 16), amount: uint, counterparty: (optional principal), block-height: uint}), current-id: uint}))
+  (let ((user (get user state))
+        (start (get start state))
+        (count (get count state))
+        (found (get found state))
+        (results (get results state))
+        (current-id (get current-id state))
+        (current-counter (var-get transaction-counter)))
+    (if (or (>= found count) (>= current-id current-counter))
+      state
+      (match (map-get? transaction-history current-id)
+        transaction (if (is-eq (get user transaction) user)
+                     {user: user, start: start, count: count, found: (+ found u1), results: (unwrap-panic (as-max-len? (append results transaction) u10)), current-id: (+ current-id u1)}
+                     {user: user, start: start, count: count, found: found, results: results, current-id: (+ current-id u1)})
+        {user: user, start: start, count: count, found: found, results: results, current-id: (+ current-id u1)}))))
+
+(define-private (check-and-add-transaction (index uint) (state {start: uint, count: uint, found: uint, results: (list 20 {user: principal, tx-type: (string-ascii 16), amount: uint, counterparty: (optional principal), block-height: uint}), current-id: uint}))
+  (let ((start (get start state))
+        (count (get count state))
+        (found (get found state))
+        (results (get results state))
+        (current-id (get current-id state)))
+    (if (>= found count)
+      state
+      (match (map-get? transaction-history current-id)
+        transaction {start: start, count: count, found: (+ found u1), results: (unwrap-panic (as-max-len? (append results transaction) u20)), current-id: (+ current-id u1)}
+        {start: start, count: count, found: found, results: results, current-id: (+ current-id u1)}))))
