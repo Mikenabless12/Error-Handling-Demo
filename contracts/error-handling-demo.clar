@@ -9,11 +9,15 @@
 (define-constant ERR-ACCOUNT-LOCKED (err u108))
 (define-constant ERR-WITHDRAWAL-LIMIT-EXCEEDED (err u109))
 (define-constant ERR-INVALID-PAGE (err u110))
+(define-constant ERR-PENDING-TRANSACTION-NOT-FOUND (err u111))
+(define-constant ERR-TRANSACTION-EXPIRED (err u112))
+(define-constant ERR-APPROVAL-NOT-REQUIRED (err u113))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-supply uint u1000000)
 (define-data-var daily-withdrawal-limit uint u10000)
 (define-data-var transaction-counter uint u0)
+(define-data-var pending-transaction-counter uint u0)
 
 (define-map user-balances principal uint)
 (define-map user-passwords principal (string-ascii 64))
@@ -22,6 +26,9 @@
 (define-map withdrawal-timestamps principal uint)
 (define-map transaction-history uint {user: principal, tx-type: (string-ascii 16), amount: uint, counterparty: (optional principal), block-height: uint})
 (define-map user-transaction-count principal uint)
+(define-map approval-thresholds principal uint)
+(define-map pending-transactions uint {user: principal, tx-type: (string-ascii 16), amount: uint, counterparty: (optional principal), created-at: uint, expires-at: uint})
+(define-map user-pending-count principal uint)
 
 (define-public (create-account (password (string-ascii 64)))
   (let ((caller tx-sender))
@@ -33,6 +40,8 @@
         (map-set user-locked caller false)
         (map-set daily-withdrawals caller u0)
         (map-set user-transaction-count caller u0)
+        (map-set approval-thresholds caller u0)
+        (map-set user-pending-count caller u0)
         (ok true)))))
 
 (define-public (deposit (amount uint))
@@ -288,3 +297,154 @@
       (match (map-get? transaction-history current-id)
         transaction {start: start, count: count, found: (+ found u1), results: (unwrap-panic (as-max-len? (append results transaction) u20)), current-id: (+ current-id u1)}
         {start: start, count: count, found: found, results: results, current-id: (+ current-id u1)}))))
+
+(define-public (set-approval-threshold (threshold uint))
+  (let ((caller tx-sender))
+    (if (is-none (map-get? user-balances caller))
+      ERR-USER-NOT-FOUND
+      (begin
+        (map-set approval-thresholds caller threshold)
+        (ok threshold)))))
+
+(define-public (request-withdrawal-approval (amount uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (threshold (default-to u0 (map-get? approval-thresholds caller)))
+        (current-balance (default-to u0 (map-get? user-balances caller)))
+        (stored-password (map-get? user-passwords caller))
+        (is-locked (default-to false (map-get? user-locked caller))))
+    (if (is-none (map-get? user-balances caller))
+      ERR-USER-NOT-FOUND
+      (if is-locked
+        ERR-ACCOUNT-LOCKED
+        (if (<= amount threshold)
+          ERR-APPROVAL-NOT-REQUIRED
+          (if (is-none stored-password)
+            ERR-INVALID-PASSWORD
+            (if (not (is-eq (unwrap-panic stored-password) password))
+              ERR-INVALID-PASSWORD
+              (if (<= amount u0)
+                ERR-INVALID-AMOUNT
+                (if (> amount current-balance)
+                  ERR-INSUFFICIENT-BALANCE
+                  (create-pending-transaction caller "withdrawal" amount none))))))))))
+
+(define-public (request-transfer-approval (recipient principal) (amount uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (threshold (default-to u0 (map-get? approval-thresholds caller)))
+        (sender-balance (default-to u0 (map-get? user-balances caller)))
+        (stored-password (map-get? user-passwords caller))
+        (is-locked (default-to false (map-get? user-locked caller))))
+    (if (is-none (map-get? user-balances caller))
+      ERR-USER-NOT-FOUND
+      (if (is-none (map-get? user-balances recipient))
+        ERR-INVALID-RECIPIENT
+        (if is-locked
+          ERR-ACCOUNT-LOCKED
+          (if (<= amount threshold)
+            ERR-APPROVAL-NOT-REQUIRED
+            (if (is-none stored-password)
+              ERR-INVALID-PASSWORD
+              (if (not (is-eq (unwrap-panic stored-password) password))
+                ERR-INVALID-PASSWORD
+                (if (<= amount u0)
+                  ERR-INVALID-AMOUNT
+                  (if (> amount sender-balance)
+                    ERR-INSUFFICIENT-BALANCE
+                    (if (is-eq caller recipient)
+                      ERR-INVALID-RECIPIENT
+                      (create-pending-transaction caller "transfer" amount (some recipient)))))))))))))
+
+(define-public (approve-transaction (pending-tx-id uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (stored-password (map-get? user-passwords caller))
+        (pending-tx (map-get? pending-transactions pending-tx-id)))
+    (if (is-none pending-tx)
+      ERR-PENDING-TRANSACTION-NOT-FOUND
+      (let ((tx-data (unwrap-panic pending-tx))
+            (tx-user (get user tx-data))
+            (tx-type (get tx-type tx-data))
+            (tx-amount (get amount tx-data))
+            (tx-counterparty (get counterparty tx-data))
+            (expires-at (get expires-at tx-data)))
+        (if (not (is-eq caller tx-user))
+          ERR-NOT-AUTHORIZED
+          (if (> stacks-block-height expires-at)
+            ERR-TRANSACTION-EXPIRED
+            (if (is-none stored-password)
+              ERR-INVALID-PASSWORD
+              (if (not (is-eq (unwrap-panic stored-password) password))
+                ERR-INVALID-PASSWORD
+                (begin
+                  (map-delete pending-transactions pending-tx-id)
+                  (if (is-eq tx-type "withdrawal")
+                    (begin
+                      (unwrap-panic (execute-approved-withdrawal tx-user tx-amount))
+                      (ok true))
+                    (execute-approved-transfer tx-user (unwrap-panic tx-counterparty) tx-amount)))))))))))
+
+(define-public (reject-transaction (pending-tx-id uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (stored-password (map-get? user-passwords caller))
+        (pending-tx (map-get? pending-transactions pending-tx-id)))
+    (if (is-none pending-tx)
+      ERR-PENDING-TRANSACTION-NOT-FOUND
+      (let ((tx-data (unwrap-panic pending-tx))
+            (tx-user (get user tx-data)))
+        (if (not (is-eq caller tx-user))
+          ERR-NOT-AUTHORIZED
+          (if (is-none stored-password)
+            ERR-INVALID-PASSWORD
+            (if (not (is-eq (unwrap-panic stored-password) password))
+              ERR-INVALID-PASSWORD
+              (begin
+                (map-delete pending-transactions pending-tx-id)
+                (ok true)))))))))
+
+(define-read-only (get-approval-threshold (user principal))
+  (ok (default-to u0 (map-get? approval-thresholds user))))
+
+(define-read-only (get-pending-transaction (pending-tx-id uint))
+  (match (map-get? pending-transactions pending-tx-id)
+    transaction (ok transaction)
+    ERR-PENDING-TRANSACTION-NOT-FOUND))
+
+(define-read-only (get-user-pending-count (user principal))
+  (ok (default-to u0 (map-get? user-pending-count user))))
+
+(define-private (create-pending-transaction (user principal) (tx-type (string-ascii 16)) (amount uint) (counterparty (optional principal)))
+  (let ((pending-counter (var-get pending-transaction-counter))
+        (user-pending (default-to u0 (map-get? user-pending-count user)))
+        (expires-at (+ stacks-block-height u144)))
+    (begin
+      (map-set pending-transactions pending-counter {
+        user: user,
+        tx-type: tx-type,
+        amount: amount,
+        counterparty: counterparty,
+        created-at: stacks-block-height,
+        expires-at: expires-at
+      })
+      (map-set user-pending-count user (+ user-pending u1))
+      (var-set pending-transaction-counter (+ pending-counter u1))
+      (ok pending-counter))))
+
+(define-private (execute-approved-withdrawal (user principal) (amount uint))
+  (let ((current-balance (default-to u0 (map-get? user-balances user))))
+    (if (> amount current-balance)
+      ERR-INSUFFICIENT-BALANCE
+      (begin
+        (map-set user-balances user (- current-balance amount))
+        (unwrap-panic (log-transaction user "withdrawal" amount none))
+        (ok (- current-balance amount))))))
+
+(define-private (execute-approved-transfer (sender principal) (recipient principal) (amount uint))
+  (let ((sender-balance (default-to u0 (map-get? user-balances sender)))
+        (recipient-balance (default-to u0 (map-get? user-balances recipient))))
+    (if (> amount sender-balance)
+      ERR-INSUFFICIENT-BALANCE
+      (begin
+        (map-set user-balances sender (- sender-balance amount))
+        (map-set user-balances recipient (+ recipient-balance amount))
+        (unwrap-panic (log-transaction sender "transfer-out" amount (some recipient)))
+        (unwrap-panic (log-transaction recipient "transfer-in" amount (some sender)))
+        (ok true)))))
