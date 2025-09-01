@@ -12,12 +12,19 @@
 (define-constant ERR-PENDING-TRANSACTION-NOT-FOUND (err u111))
 (define-constant ERR-TRANSACTION-EXPIRED (err u112))
 (define-constant ERR-APPROVAL-NOT-REQUIRED (err u113))
+(define-constant ERR-RECOVERY-NOT-FOUND (err u114))
+(define-constant ERR-RECOVERY-EXPIRED (err u115))
+(define-constant ERR-RECOVERY-ACTIVE (err u116))
+(define-constant ERR-INVALID-RECOVERY-CONTACT (err u117))
+(define-constant ERR-INSUFFICIENT-VOTES (err u118))
+(define-constant ERR-ALREADY-VOTED (err u119))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-supply uint u1000000)
 (define-data-var daily-withdrawal-limit uint u10000)
 (define-data-var transaction-counter uint u0)
 (define-data-var pending-transaction-counter uint u0)
+(define-data-var recovery-request-counter uint u0)
 
 (define-map user-balances principal uint)
 (define-map user-passwords principal (string-ascii 64))
@@ -29,6 +36,10 @@
 (define-map approval-thresholds principal uint)
 (define-map pending-transactions uint {user: principal, tx-type: (string-ascii 16), amount: uint, counterparty: (optional principal), created-at: uint, expires-at: uint})
 (define-map user-pending-count principal uint)
+(define-map recovery-contacts {user: principal, contact: principal} bool)
+(define-map user-recovery-contact-count principal uint)
+(define-map recovery-requests uint {user: principal, new-password: (string-ascii 64), created-at: uint, expires-at: uint, votes: uint, required-votes: uint})
+(define-map recovery-votes {request-id: uint, voter: principal} bool)
 
 (define-public (create-account (password (string-ascii 64)))
   (let ((caller tx-sender))
@@ -42,6 +53,7 @@
         (map-set user-transaction-count caller u0)
         (map-set approval-thresholds caller u0)
         (map-set user-pending-count caller u0)
+        (map-set user-recovery-contact-count caller u0)
         (ok true)))))
 
 (define-public (deposit (amount uint))
@@ -448,3 +460,139 @@
         (unwrap-panic (log-transaction sender "transfer-out" amount (some recipient)))
         (unwrap-panic (log-transaction recipient "transfer-in" amount (some sender)))
         (ok true)))))
+
+(define-public (add-recovery-contact (contact principal))
+  (let ((caller tx-sender)
+        (contact-count (default-to u0 (map-get? user-recovery-contact-count caller))))
+    (if (is-none (map-get? user-balances caller))
+      ERR-USER-NOT-FOUND
+      (if (is-eq caller contact)
+        ERR-INVALID-RECOVERY-CONTACT
+        (if (is-none (map-get? user-balances contact))
+          ERR-INVALID-RECOVERY-CONTACT
+          (if (>= contact-count u5)
+            ERR-INVALID-AMOUNT
+            (if (is-some (map-get? recovery-contacts {user: caller, contact: contact}))
+              ERR-ALREADY-EXISTS
+              (begin
+                (map-set recovery-contacts {user: caller, contact: contact} true)
+                (map-set user-recovery-contact-count caller (+ contact-count u1))
+                (ok true)))))))))
+
+(define-public (remove-recovery-contact (contact principal) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (stored-password (map-get? user-passwords caller))
+        (contact-count (default-to u0 (map-get? user-recovery-contact-count caller))))
+    (if (is-none (map-get? user-balances caller))
+      ERR-USER-NOT-FOUND
+      (if (is-none stored-password)
+        ERR-INVALID-PASSWORD
+        (if (not (is-eq (unwrap-panic stored-password) password))
+          ERR-INVALID-PASSWORD
+          (if (is-none (map-get? recovery-contacts {user: caller, contact: contact}))
+            ERR-INVALID-RECOVERY-CONTACT
+            (begin
+              (map-delete recovery-contacts {user: caller, contact: contact})
+              (map-set user-recovery-contact-count caller (- contact-count u1))
+              (ok true))))))))
+
+(define-public (request-account-recovery (user principal) (new-password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (contact-count (default-to u0 (map-get? user-recovery-contact-count user)))
+        (recovery-counter (var-get recovery-request-counter))
+        (expires-at (+ stacks-block-height u1008)))
+    (if (is-none (map-get? user-balances user))
+      ERR-USER-NOT-FOUND
+      (if (not (is-some (map-get? recovery-contacts {user: user, contact: caller})))
+        ERR-INVALID-RECOVERY-CONTACT
+        (if (< contact-count u2)
+          ERR-INSUFFICIENT-VOTES
+          (if false
+            ERR-RECOVERY-ACTIVE
+            (let ((required-votes (calculate-required-votes contact-count)))
+              (begin
+                (map-set recovery-requests recovery-counter {
+                  user: user,
+                  new-password: new-password,
+                  created-at: stacks-block-height,
+                  expires-at: expires-at,
+                  votes: u1,
+                  required-votes: required-votes
+                })
+                (map-set recovery-votes {request-id: recovery-counter, voter: caller} true)
+                (var-set recovery-request-counter (+ recovery-counter u1))
+                (ok recovery-counter)))))))))
+
+(define-public (vote-recovery (request-id uint))
+  (let ((caller tx-sender)
+        (request (map-get? recovery-requests request-id)))
+    (if (is-none request)
+      ERR-RECOVERY-NOT-FOUND
+      (let ((request-data (unwrap-panic request))
+            (user (get user request-data))
+            (expires-at (get expires-at request-data))
+            (current-votes (get votes request-data))
+            (required-votes (get required-votes request-data)))
+        (if (> stacks-block-height expires-at)
+          ERR-RECOVERY-EXPIRED
+          (if (not (is-some (map-get? recovery-contacts {user: user, contact: caller})))
+            ERR-INVALID-RECOVERY-CONTACT
+            (if (is-some (map-get? recovery-votes {request-id: request-id, voter: caller}))
+              ERR-ALREADY-VOTED
+              (let ((new-votes (+ current-votes u1)))
+                (begin
+                  (map-set recovery-votes {request-id: request-id, voter: caller} true)
+                  (map-set recovery-requests request-id (merge request-data {votes: new-votes}))
+                  (if (>= new-votes required-votes)
+                    (execute-recovery request-id request-data)
+                    (ok true)))))))))))
+
+(define-public (cancel-recovery-request (request-id uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (stored-password (map-get? user-passwords caller))
+        (request (map-get? recovery-requests request-id)))
+    (if (is-none request)
+      ERR-RECOVERY-NOT-FOUND
+      (let ((request-data (unwrap-panic request))
+            (user (get user request-data)))
+        (if (not (is-eq caller user))
+          ERR-NOT-AUTHORIZED
+          (if (is-none stored-password)
+            ERR-INVALID-PASSWORD
+            (if (not (is-eq (unwrap-panic stored-password) password))
+              ERR-INVALID-PASSWORD
+              (begin
+                (map-delete recovery-requests request-id)
+                (ok true)))))))))
+
+(define-read-only (get-recovery-contact-count (user principal))
+  (ok (default-to u0 (map-get? user-recovery-contact-count user))))
+
+(define-read-only (is-recovery-contact (user principal) (contact principal))
+  (ok (is-some (map-get? recovery-contacts {user: user, contact: contact}))))
+
+(define-read-only (get-recovery-request (request-id uint))
+  (match (map-get? recovery-requests request-id)
+    request (ok request)
+    ERR-RECOVERY-NOT-FOUND))
+
+(define-read-only (has-voted-recovery (request-id uint) (voter principal))
+  (ok (is-some (map-get? recovery-votes {request-id: request-id, voter: voter}))))
+
+
+
+(define-private (calculate-required-votes (total-contacts uint))
+  (if (<= total-contacts u2)
+    u2
+    (if (<= total-contacts u3)
+      u2
+      (/ (* total-contacts u2) u3))))
+
+(define-private (execute-recovery (request-id uint) (request-data {user: principal, new-password: (string-ascii 64), created-at: uint, expires-at: uint, votes: uint, required-votes: uint}))
+  (let ((user (get user request-data))
+        (new-password (get new-password request-data)))
+    (begin
+      (map-set user-passwords user new-password)
+      (map-set user-locked user false)
+      (map-delete recovery-requests request-id)
+      (ok true))))
