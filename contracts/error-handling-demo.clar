@@ -18,6 +18,9 @@
 (define-constant ERR-INVALID-RECOVERY-CONTACT (err u117))
 (define-constant ERR-INSUFFICIENT-VOTES (err u118))
 (define-constant ERR-ALREADY-VOTED (err u119))
+(define-constant ERR-SCHEDULED-PAYMENT-NOT-FOUND (err u120))
+(define-constant ERR-PAYMENT-NOT-DUE (err u121))
+(define-constant ERR-PAYMENT-ALREADY-EXECUTED (err u122))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-supply uint u1000000)
@@ -25,6 +28,7 @@
 (define-data-var transaction-counter uint u0)
 (define-data-var pending-transaction-counter uint u0)
 (define-data-var recovery-request-counter uint u0)
+(define-data-var scheduled-payment-counter uint u0)
 
 (define-map user-balances principal uint)
 (define-map user-passwords principal (string-ascii 64))
@@ -40,6 +44,8 @@
 (define-map user-recovery-contact-count principal uint)
 (define-map recovery-requests uint {user: principal, new-password: (string-ascii 64), created-at: uint, expires-at: uint, votes: uint, required-votes: uint})
 (define-map recovery-votes {request-id: uint, voter: principal} bool)
+(define-map scheduled-payments uint {sender: principal, recipient: principal, amount: uint, interval-blocks: uint, next-payment-block: uint, total-payments: uint, executed-payments: uint, active: bool})
+(define-map user-scheduled-payment-count principal uint)
 
 (define-public (create-account (password (string-ascii 64)))
   (let ((caller tx-sender))
@@ -54,6 +60,7 @@
         (map-set approval-thresholds caller u0)
         (map-set user-pending-count caller u0)
         (map-set user-recovery-contact-count caller u0)
+        (map-set user-scheduled-payment-count caller u0)
         (ok true)))))
 
 (define-public (deposit (amount uint))
@@ -596,3 +603,107 @@
       (map-set user-locked user false)
       (map-delete recovery-requests request-id)
       (ok true))))
+
+(define-public (create-scheduled-payment (recipient principal) (amount uint) (interval-blocks uint) (total-payments uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (stored-password (map-get? user-passwords caller))
+        (current-balance (default-to u0 (map-get? user-balances caller)))
+        (payment-counter (var-get scheduled-payment-counter))
+        (user-payment-count (default-to u0 (map-get? user-scheduled-payment-count caller))))
+    (if (is-none (map-get? user-balances caller))
+      ERR-USER-NOT-FOUND
+      (if (is-none (map-get? user-balances recipient))
+        ERR-INVALID-RECIPIENT
+        (if (is-none stored-password)
+          ERR-INVALID-PASSWORD
+          (if (not (is-eq (unwrap-panic stored-password) password))
+            ERR-INVALID-PASSWORD
+            (if (<= amount u0)
+              ERR-INVALID-AMOUNT
+              (if (<= interval-blocks u0)
+                ERR-INVALID-AMOUNT
+                (if (<= total-payments u0)
+                  ERR-INVALID-AMOUNT
+                  (if (is-eq caller recipient)
+                    ERR-INVALID-RECIPIENT
+                    (begin
+                      (map-set scheduled-payments payment-counter {
+                        sender: caller,
+                        recipient: recipient,
+                        amount: amount,
+                        interval-blocks: interval-blocks,
+                        next-payment-block: (+ stacks-block-height interval-blocks),
+                        total-payments: total-payments,
+                        executed-payments: u0,
+                        active: true
+                      })
+                      (map-set user-scheduled-payment-count caller (+ user-payment-count u1))
+                      (var-set scheduled-payment-counter (+ payment-counter u1))
+                      (ok payment-counter))))))))))))
+
+(define-public (execute-scheduled-payment (payment-id uint))
+  (let ((payment (map-get? scheduled-payments payment-id)))
+    (if (is-none payment)
+      ERR-SCHEDULED-PAYMENT-NOT-FOUND
+      (let ((payment-data (unwrap-panic payment))
+            (sender (get sender payment-data))
+            (recipient (get recipient payment-data))
+            (amount (get amount payment-data))
+            (next-payment-block (get next-payment-block payment-data))
+            (interval-blocks (get interval-blocks payment-data))
+            (total-payments (get total-payments payment-data))
+            (executed-payments (get executed-payments payment-data))
+            (active (get active payment-data))
+            (sender-balance (default-to u0 (map-get? user-balances sender)))
+            (recipient-balance (default-to u0 (map-get? user-balances recipient))))
+        (if (not active)
+          ERR-PAYMENT-ALREADY-EXECUTED
+          (if (> next-payment-block stacks-block-height)
+            ERR-PAYMENT-NOT-DUE
+            (if (> amount sender-balance)
+              ERR-INSUFFICIENT-BALANCE
+              (let ((new-executed-payments (+ executed-payments u1))
+                    (is-final-payment (>= new-executed-payments total-payments))
+                    (new-next-payment-block (+ next-payment-block interval-blocks)))
+                (begin
+                  (map-set user-balances sender (- sender-balance amount))
+                  (map-set user-balances recipient (+ recipient-balance amount))
+                  (unwrap-panic (log-transaction sender "scheduled-pay" amount (some recipient)))
+                  (unwrap-panic (log-transaction recipient "scheduled-rcv" amount (some sender)))
+                  (if is-final-payment
+                    (map-set scheduled-payments payment-id (merge payment-data {executed-payments: new-executed-payments, active: false}))
+                    (map-set scheduled-payments payment-id (merge payment-data {executed-payments: new-executed-payments, next-payment-block: new-next-payment-block})))
+                  (ok new-executed-payments))))))))))
+
+(define-public (cancel-scheduled-payment (payment-id uint) (password (string-ascii 64)))
+  (let ((caller tx-sender)
+        (stored-password (map-get? user-passwords caller))
+        (payment (map-get? scheduled-payments payment-id)))
+    (if (is-none payment)
+      ERR-SCHEDULED-PAYMENT-NOT-FOUND
+      (let ((payment-data (unwrap-panic payment))
+            (sender (get sender payment-data)))
+        (if (not (is-eq caller sender))
+          ERR-NOT-AUTHORIZED
+          (if (is-none stored-password)
+            ERR-INVALID-PASSWORD
+            (if (not (is-eq (unwrap-panic stored-password) password))
+              ERR-INVALID-PASSWORD
+              (begin
+                (map-set scheduled-payments payment-id (merge payment-data {active: false}))
+                (ok true)))))))))
+
+(define-read-only (get-scheduled-payment (payment-id uint))
+  (match (map-get? scheduled-payments payment-id)
+    payment (ok payment)
+    ERR-SCHEDULED-PAYMENT-NOT-FOUND))
+
+(define-read-only (get-user-scheduled-payment-count (user principal))
+  (ok (default-to u0 (map-get? user-scheduled-payment-count user))))
+
+(define-read-only (is-payment-due (payment-id uint))
+  (match (map-get? scheduled-payments payment-id)
+    payment (let ((next-payment-block (get next-payment-block payment))
+                  (active (get active payment)))
+              (ok (and active (<= next-payment-block stacks-block-height))))
+    ERR-SCHEDULED-PAYMENT-NOT-FOUND))
